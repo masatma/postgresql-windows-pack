@@ -1,0 +1,95 @@
+name: Build PostgreSQL Windows Package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  # update the following for new release build.
+  RELEASE_TAG: "REL_18_6"
+  RELEASE_SEMVAR: "18.6.0"
+  RELEASE_MAJOR: "18"
+
+jobs:
+  build:
+    runs-on: 'windows-latest'
+
+    steps:
+      - name: checkout main
+        uses: actions/checkout@v6
+      - name: Set up directories
+        shell: pwsh
+        run: |
+          $repoRoot = "${{github.workspace}}"
+          $stagedRoot = Join-Path $repoRoot "staged"
+          $toolsRoot = Join-Path $stagedRoot "tools"
+          $binRoot = Join-Path $stagedRoot "bin"
+          if (Test-Path $stagedRoot) {
+            Remove-Item $stagedRoot -Recurse -Force
+          }
+
+          New-Item $stagedRoot -ItemType Directory -Force
+          New-Item $toolsRoot -ItemType Directory -Force
+          New-Item $binRoot -ItemType Directory -Force
+      - name: Clone PostgreSQL
+        shell: pwsh
+        run: |
+          Push-Location staged
+          git clone https://git.postgresql.org/git/postgresql.git
+          Push-Location postgresql
+          git checkout $env:RELEASE_TAG
+          Pop-Location
+          Pop-Location
+      - name: Install Meson and Ninja
+        run: pip install meson ninja
+      - name: Install required Chocolatey packages
+        shell: pwsh
+        run: |
+          choco install winflexbison3 -y
+          choco install sed -y
+          choco install gzip -y
+          choco install strawberryperl -y
+          choco install diffutils -y
+          choco install innosetup -y
+      - name: Build PostgreSQL with Meson/Ninja
+        shell: pwsh
+        run: |
+          $binRoot = "${{github.workspace}}\staged\bin\pgsql"
+          Push-Location staged/postgresql
+          meson setup build "--prefix=$binRoot"
+          Push-Location build
+          ninja
+          ninja install
+          Pop-Location
+          Pop-Location
+      - name: Decode Sign Certificate
+        shell: pwsh
+        run: |
+          $pfxPath = "$env:USERPROFILE\\codesign.pfx"
+          [System.Convert]::FromBase64String("${{secrets.SIGN_CERT_BASE64}}") | Set-Content -AsByteStream $pfxPath
+      - name: Sign binaries
+        shell: pwsh
+        run: |
+          $pfxPath = "$env:USERPROFILE\\codesign.pfx"
+          $signTool = (Get-Childitem -s "C:\Program Files (x86)\Windows Kits\10\bin\signtool.exe" | where {$_.FullName -like "*\x64\*"} | select -Last 1 FullName).FullName
+          get-childitem -Path .\staged\bin\pgsql\*.exe | `
+            foreach { & $signTool sign /f $pfxPath /p "${{secrets.SIGN_CERT_PASSWORD}}" /tr http://timestamp.digicert.com /td SHA256 /fd SHA256 $_.FullName }
+          get-childitem -Path .\staged\bin\pgsql\*.dll | `
+            foreach { & $signTool sign /f $pfxPath /p "${{secrets.SIGN_CERT_PASSWORD}}" /tr http://timestamp.digicert.com /td SHA256 /fd SHA256 $_.FullName }
+      - name: Inno Setup Action
+        shell: pwsh
+        run: |
+          & "$env:ProgramData\chocolatey\bin\ISCC.exe" "/DReleaseMajor=$env:RELEASE_MAJOR" "/DReleaseSemvar=$env:RELEASE_SEMVAR" ".\src\setup\postgresql-installer.iss"
+      - name: Sign installer
+        shell: pwsh
+        run: |
+          $pfxPath = "$env:USERPROFILE\\codesign.pfx"
+          $signTool = (Get-Childitem -s "C:\Program Files (x86)\Windows Kits\10\bin\signtool.exe" | where {$_.FullName -like "*\x64\*"} | select -Last 1 FullName).FullName
+          get-childitem -Path .\staged\setup\*.exe | `
+            foreach { & $signTool sign /f $pfxPath /p "${{secrets.SIGN_CERT_PASSWORD}}" /tr http://timestamp.digicert.com /td SHA256 /fd SHA256 $_.FullName }
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: postgresql-windows-installer
+          path: staged/setup
